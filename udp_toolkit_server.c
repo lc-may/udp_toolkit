@@ -15,8 +15,9 @@
 
 #define SYNC_PORT   4000
 #define DATA_PORT   5000
-#define PACKET_SIZE 1000    // Keep consistent with client
-#define DEBUG       1       // Set to 0 to disable debug output
+#define MAX_PACKET_SIZE 8192    // Maximum supported packet size
+#define DEBUG       1           // Set to 0 to disable debug output
+#define HEADER_SIZE 20          // Seq(4) + send_ts(8) + offset(8) + packet_size(4)
 
 // Get monotonic clock time in seconds
 static double monotonic_sec() {
@@ -66,6 +67,9 @@ int main() {
     uint64_t bytes_interval = 0;            // Current interval bytes
     uint64_t total_bytes    = 0;            // Total received bytes
     uint64_t sync_requests  = 0;            // Clock sync request counter
+    uint64_t total_packets  = 0;            // Total received packets counter
+    int last_seq = -1;                      // Last sequence number (for gap detection)
+    int total_gaps = 0;                     // Count of sequence gaps
 
     printf("UDP Toolkit Server started - Clock Sync Port: %d, Data Port: %d\n", SYNC_PORT, DATA_PORT);
     debug_print("Debug mode enabled\n");
@@ -94,6 +98,15 @@ int main() {
     }
     debug_print("Data socket bound to port %d\n", DATA_PORT);
 
+    // 分配接收缓冲区（最大大小）
+    char* recv_buffer = (char*)malloc(MAX_PACKET_SIZE);
+    if (!recv_buffer) {
+        perror("Failed to allocate receive buffer");
+        close(sync_sock);
+        close(data_sock);
+        return 1;
+    }
+
     // --- 4. Main loop: select to monitor SYNC and DATA ---
     fd_set readfds;
     int maxfd = (sync_sock > data_sock ? sync_sock : data_sock) + 1;
@@ -119,28 +132,48 @@ int main() {
 
         // --- 4.2 Handle data packet reception and latency calculation ---
         if (FD_ISSET(data_sock, &readfds)) {
-            char buf[PACKET_SIZE];
             struct sockaddr_in cli;
             socklen_t len = sizeof(cli);
-            ssize_t n = recvfrom(data_sock, buf, PACKET_SIZE, 0,
+            ssize_t n = recvfrom(data_sock, recv_buffer, MAX_PACKET_SIZE, 0,
                                  (struct sockaddr*)&cli, &len);
-            // Verify packet contains at least seq + send_ts(8B) + offset(8B)
-            if (n >= (ssize_t)(sizeof(int) + sizeof(double)*2)) {
+            
+            // Verify packet contains at least the header
+            if (n >= HEADER_SIZE) {
                 // --- 4.2.1 Get reception timestamp ---
                 double recv_sec = monotonic_sec();
+                total_packets++;
 
-                // --- 4.2.2 Parse seq, send_ts, offset ---
-                int    seq;
+                // --- 4.2.2 Parse seq, send_ts, offset, and packet_size ---
+                int    seq, reported_size;
                 double send_ts, offset;
                 size_t pos = 0;
-                memcpy(&seq,     buf + pos, sizeof(seq));      pos += sizeof(seq);
-                memcpy(&send_ts, buf + pos, sizeof(send_ts));  pos += sizeof(send_ts);
-                memcpy(&offset,  buf + pos, sizeof(offset));
+                
+                memcpy(&seq,          recv_buffer + pos, sizeof(seq));      pos += sizeof(seq);
+                memcpy(&send_ts,      recv_buffer + pos, sizeof(send_ts));  pos += sizeof(send_ts);
+                memcpy(&offset,       recv_buffer + pos, sizeof(offset));   pos += sizeof(offset);
+                memcpy(&reported_size, recv_buffer + pos, sizeof(reported_size));
+
+                // Check for sequence number gaps
+                if (last_seq != -1 && seq != last_seq + 1) {
+                    int gap_size = seq - last_seq - 1;
+                    if (gap_size > 0) {
+                        total_gaps += gap_size;
+                        debug_print("Sequence gap detected: %d packets missing between %d and %d\n", 
+                                   gap_size, last_seq, seq);
+                    }
+                }
+                last_seq = seq;
 
                 // --- 4.2.3 Calculate and print one-way latency (milliseconds) ---
                 double latency = recv_sec - (send_ts + offset);
-                debug_print("Seq=%d, Send_ts=%.9f, Latency=%.6f ms\n",
-                       seq, send_ts, fabs(latency) * 1e3);
+                debug_print("Seq=%d, Size=%d bytes, Latency=%.6f ms\n",
+                       seq, (int)n, fabs(latency) * 1e3);
+                
+                // Verify reported packet size matches actual received size
+                if (reported_size != n) {
+                    debug_print("Warning: Reported packet size (%d) differs from received size (%zd)\n",
+                               reported_size, n);
+                }
                 
                 if (DEBUG && seq % 1000 == 0) {
                     char client_ip[INET_ADDRSTRLEN];
@@ -149,46 +182,49 @@ int main() {
                     debug_print("  → Source: %s:%d\n", client_ip, ntohs(cli.sin_port));
                     debug_print("  → Send time: %.9f\n", send_ts);
                     debug_print("  → Offset: %.9f\n", offset);
+                    debug_print("  → Reported size: %d bytes\n", reported_size);
+                    debug_print("  → Actual received size: %zd bytes\n", n);
                     debug_print("  → Receive time: %.9f\n", recv_sec);
-                    debug_print("  → Size: %zd bytes\n", n);
+                    debug_print("  → Total sequence gaps: %d\n", total_gaps);
                 }
 
                 // --- 4.2.4 Accumulate byte statistics ---
                 bytes_interval += (uint64_t)n;
                 total_bytes    += (uint64_t)n;
             } else {
-                debug_print("Received invalid data packet (size: %zd, min expected: %zd)\n", 
-                           n, sizeof(int) + sizeof(double)*2);
+                debug_print("Received invalid data packet (size: %zd, min expected: %d)\n", 
+                           n, HEADER_SIZE);
             }
         }
 
-        // // --- 5. Sample throughput every second & calculate average ---
-        // {
-        //     double now_sec = monotonic_sec();
-        //     if (now_sec - last_sec >= 1.0) {
-        //         double interval = now_sec - last_sec;           // Real elapsed time
-        //         // bps = bits / sec
-        //         double sample_tps = (bytes_interval * 8.0) / interval;
-        //         double avg_tps    = (total_bytes   * 8.0) / (now_sec - start_sec);
+        // --- 5. Sample throughput every second & calculate average ---
+        {
+            double now_sec = monotonic_sec();
+            if (now_sec - last_sec >= 1.0) {
+                double interval = now_sec - last_sec;           // Real elapsed time
+                // bps = bits / sec
+                double sample_tps = (bytes_interval * 8.0) / interval;
+                double avg_tps    = (total_bytes   * 8.0) / (now_sec - start_sec);
 
-        //         printf("[%.0f-%.0f s] Sample Throughput: %.3f bps, "
-        //                "Average Throughput: %.3f bps\n",
-        //                last_sec - start_sec,
-        //                now_sec  - start_sec,
-        //                sample_tps,
-        //                avg_tps);
+                printf("[%.0f-%.0f s] Sample Throughput: %.3f Mbps, "
+                       "Average Throughput: %.3f Mbps\n",
+                       last_sec - start_sec,
+                       now_sec  - start_sec,
+                       sample_tps / 1e6,
+                       avg_tps / 1e6);
                        
-        //         debug_print("Stats update: interval_bytes=%llu, total_bytes=%llu, sync_requests=%llu\n",
-        //                    bytes_interval, total_bytes, sync_requests);
+                debug_print("Stats update: packets=%llu, bytes=%llu, gaps=%d, interval_bytes=%llu, total_bytes=%llu\n",
+                           total_packets, total_bytes, total_gaps, bytes_interval, total_bytes);
 
-        //         // Reset sampling interval
-        //         bytes_interval = 0;
-        //         last_sec       = now_sec;
-        //     }
-        // }
+                // Reset sampling interval
+                bytes_interval = 0;
+                last_sec       = now_sec;
+            }
+        }
     }
 
     debug_print("Server shutting down...\n");
+    free(recv_buffer);
     close(sync_sock);
     close(data_sock);
     return 0;
